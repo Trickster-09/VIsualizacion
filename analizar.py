@@ -35,6 +35,7 @@ from textblob import TextBlob
 import gensim
 from gensim import corpora
 from gensim.models import LdaModel
+from gensim.models import CoherenceModel
 from wordcloud import WordCloud
 
 # ─── Visualizaciones ───────────────────────────────────────────────────────
@@ -78,6 +79,15 @@ def parse_args():
     parser.add_argument("idioma",   help="Idioma: es | en | fr")
     parser.add_argument("titulo",   help='Título del reporte (entre comillas si tiene espacios)')
     parser.add_argument("paleta",   help="Paleta de colores: viridis | cividis | plasma | inferno")
+    parser.add_argument(
+        "--optimizar",
+        action="store_true",
+        help=(
+            "Activa grid search de num_topics via Coherence Score (c_v).\n"
+            "Prueba valores de 2 a 12 tópicos y elige el mejor automáticamente.\n"
+            "Tarda más pero produce tópicos más coherentes."
+        )
+    )
     parser.add_argument(
         "--tema",
         default="precio valor costo barato caro económico tarifa pago cobro",
@@ -316,32 +326,96 @@ def analizar_sentimientos(df):
     return df_normal
 
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# 6b. GRID SEARCH DE NUM_TOPICS VIA COHERENCE SCORE
+# ════════════════════════════════════════════════════════════════════════════
+
+def grid_search_topicos(tokenized, diccionario, corpus, etiqueta, k_min=2, k_max=12):
+    """
+    Prueba num_topics de k_min a k_max.
+    Calcula Coherence Score (c_v) para cada k.
+    Devuelve el mejor k y una figura con la curva de coherence.
+    """
+    print(f"    → Grid search num_topics [{etiqueta}] (k={k_min}..{k_max}), espera...")
+
+    scores = []
+    for k in range(k_min, k_max + 1):
+        lda_tmp = LdaModel(
+            corpus=corpus,
+            id2word=diccionario,
+            num_topics=k,
+            passes=10,
+            random_state=42
+        )
+        cm = CoherenceModel(
+            model=lda_tmp,
+            texts=tokenized,
+            dictionary=diccionario,
+            coherence="c_v",
+            processes=1      # evita problemas de multiprocessing en Windows
+        )
+        score = cm.get_coherence()
+        scores.append((k, score))
+        print(f"       k={k:2d} → coherence={score:.4f}")
+
+    mejor_k, mejor_score = max(scores, key=lambda x: x[1])
+    print(f"    ✓ Mejor num_topics={mejor_k} (coherence={mejor_score:.4f})")
+
+    # Graficar curva de coherence
+    ks     = [s[0] for s in scores]
+    vals   = [s[1] for s in scores]
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(ks, vals, marker="o", linewidth=2, color="#2c7bb6")
+    ax.axvline(mejor_k, color="#d7191c", linestyle="--", label=f"Mejor k={mejor_k}")
+    ax.set_xlabel("Número de tópicos (k)")
+    ax.set_ylabel("Coherence Score (c_v)")
+    ax.set_title(f"Grid Search LDA — {etiqueta}")
+    ax.set_xticks(ks)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    ruta = f"outputs/coherence_{etiqueta.lower().replace(' ', '_')}.png"
+    fig.savefig(ruta, dpi=120)
+    print(f"    ✓ Curva de coherence guardada en '{ruta}'")
+
+    return mejor_k, fig
+
 # ════════════════════════════════════════════════════════════════════════════
 # 6. MODELADO DE TÓPICOS (LDA) O NUBE DE PALABRAS
 # ════════════════════════════════════════════════════════════════════════════
 
 UMBRAL_LDA = 20  # mínimo de documentos para aplicar LDA
 
-def modelar_topicos(textos, etiqueta, paleta, titulo_reporte, n_topics=3):
+def modelar_topicos(textos, etiqueta, paleta, titulo_reporte, n_topics=3, optimizar=False):
     textos = [t for t in textos if t.strip()]
 
     if len(textos) < UMBRAL_LDA:
         print(f"    ⚠ Pocos comentarios {etiqueta} ({len(textos)}). Usando nube de palabras.")
         generar_wordcloud(textos, etiqueta, paleta, titulo_reporte)
-        return None, None
-
-    print(f"    → LDA sobre comentarios {etiqueta} ({len(textos)} docs, {n_topics} tópicos)...")
+        return None, None, None
 
     tokenized = [t.split() for t in textos]
     diccionario = corpora.Dictionary(tokenized)
     diccionario.filter_extremes(no_below=2, no_above=0.9)
     corpus = [diccionario.doc2bow(t) for t in tokenized]
 
+    fig_coherence = None
+    if optimizar:
+        n_topics, fig_coherence = grid_search_topicos(
+            tokenized, diccionario, corpus, etiqueta
+        )
+    
+    print(f"    → LDA sobre comentarios {etiqueta} ({len(textos)} docs, {n_topics} tópicos)...")
+
     lda = LdaModel(
         corpus=corpus,
         id2word=diccionario,
         num_topics=n_topics,
         passes=10,
+        alpha="asymmetric",   # mejor para corpus con tópicos dominantes
+        eta="auto",           # aprende distribución de palabras automáticamente
         random_state=42
     )
 
@@ -350,7 +424,7 @@ def modelar_topicos(textos, etiqueta, paleta, titulo_reporte, n_topics=3):
         palabras = [w for w, _ in lda.show_topic(i, topn=8)]
         print(f"       Tópico {i+1}: {', '.join(palabras)}")
 
-    return lda, diccionario
+    return lda, diccionario, fig_coherence
 
 
 def generar_wordcloud(textos, etiqueta, paleta, titulo_reporte):
@@ -591,7 +665,8 @@ def imprimir_reporte(titulo, df_sentimiento, lda_pos, dic_pos, lda_neg, dic_neg,
 def generar_pdf(titulo, df, df_normal, ngramas_general, ngramas_outliers,
                 ngramas_pos, ngramas_neg, lda_pos, dic_pos, lda_neg, dic_neg,
                 fig_ngramas_general, fig_ngramas_outliers,
-                fig_ngramas_pos, fig_ngramas_neg, paleta):
+                fig_ngramas_pos, fig_ngramas_neg,
+                fig_coherence_pos, fig_coherence_neg, paleta):
     """Genera un PDF con todo el reporte de análisis."""
     os.makedirs("outputs", exist_ok=True)
     ruta = "outputs/reporte_completo.pdf"
@@ -654,6 +729,14 @@ def generar_pdf(titulo, df, df_normal, ngramas_general, ngramas_outliers,
                                       fontsize=13, fontweight="bold")
             pdf.savefig(fig_ngramas_neg, bbox_inches="tight")
             plt.close(fig_ngramas_neg)
+
+        # ── Curvas de coherence (si se usó --optimizar) ────────────────────
+        for fig_coh, etiq in [(fig_coherence_pos, "Positivos"), (fig_coherence_neg, "Negativos")]:
+            if fig_coh is not None:
+                fig_coh.suptitle(f"Grid Search Coherence Score — {etiq}",
+                                  fontsize=13, fontweight="bold")
+                pdf.savefig(fig_coh, bbox_inches="tight")
+                plt.close(fig_coh)
 
         # ── Resumen de tópicos ──────────────────────────────────────────────
         fig, ax = plt.subplots(figsize=(11, 8.5))
@@ -744,8 +827,12 @@ def main():
     pos_textos = df_normal[df_normal["sentimiento"] == "positivo"]["texto_stemmed"].tolist()
     neg_textos = df_normal[df_normal["sentimiento"] == "negativo"]["texto_stemmed"].tolist()
 
-    lda_pos, dic_pos = modelar_topicos(pos_textos, "positivos", args.paleta, args.titulo)
-    lda_neg, dic_neg = modelar_topicos(neg_textos, "negativos", args.paleta, args.titulo)
+    lda_pos, dic_pos, fig_coh_pos = modelar_topicos(
+        pos_textos, "positivos", args.paleta, args.titulo, optimizar=args.optimizar
+    )
+    lda_neg, dic_neg, fig_coh_neg = modelar_topicos(
+        neg_textos, "negativos", args.paleta, args.titulo, optimizar=args.optimizar
+    )
 
     # 6. Scatter tópicos
     generar_scatter(df_normal, vectorizer, lda_pos, dic_pos,
@@ -774,9 +861,13 @@ def main():
         fig_ngramas_outliers=fig_ng_outliers,
         fig_ngramas_pos=fig_ng_pos,
         fig_ngramas_neg=fig_ng_neg,
+        fig_coherence_pos=fig_coh_pos,
+        fig_coherence_neg=fig_coh_neg,
         paleta=args.paleta
     )
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()  # necesario en Windows
     main()
